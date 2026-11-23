@@ -1,69 +1,179 @@
-"""Scheduled public-job discovery. No login scraping or fabricated matches."""
-import json, os, re, urllib.request, datetime, html
+"""Daily public job discovery for the Job Application Control Center.
+
+No login scraping. Match scores are heuristic, not AI/CV-based assessments.
+"""
+import datetime as dt
+import html
+import json
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
 from pathlib import Path
-ROOT=Path(__file__).parent
-OUT=ROOT/'data'/'jobs.json'
-UA={'User-Agent':'JobHunterDashboard/1.0 (personal job discovery)','Accept':'application/json'}
-TITLES=['partner marketing','channel marketing','integrated marketing','field marketing','brand marketing','regional marketing','emea marketing','go-to-market','product marketing','strategic partnerships','sports marketing','marketing enablement','training and education','experiential marketing','lifestyle marketing']
-POS=['partnership','marketing','go-to-market','brand','gtm','enablement','channel','product','sports','training','field','integrated','regional','emea','campaign','education']
-SKILLS=['partnership','partner activation','go-to-market','gtm','brand','campaign','field marketing','channel','product launch','stakeholder','budget','agency','events','sports','consumer','b2b','training','education','sales enablement','international','emea','analytics','data','content','creative','community','creator','retail','marketing']
-EXCLUDE=['intern','internship','werkstudent','working student','graduate trainee','junior','assistant','praktikant']
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / 'data' / 'jobs.json'
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; PersonalJobDiscovery/1.0)', 'Accept': 'application/json'}
+TITLE_TERMS = (
+    'marketing', 'partnership', 'partner', 'brand', 'campaign', 'go-to-market',
+    'growth', 'community', 'activation', 'sponsorship', 'communications',
+    'enablement', 'education', 'training', 'events', 'experiential', 'channel'
+)
+STRONG_TITLES = (
+    'partner marketing', 'channel marketing', 'integrated marketing',
+    'field marketing', 'brand marketing', 'regional marketing', 'emea marketing',
+    'go-to-market', 'product marketing', 'strategic partnership',
+    'sports marketing', 'lifestyle marketing', 'marketing manager',
+    'campaign manager', 'partnerships manager', 'marketing lead',
+    'training manager', 'education manager', 'community manager'
+)
+SKILLS = (
+    'partnership', 'go-to-market', 'brand', 'campaign', 'field marketing',
+    'channel', 'product launch', 'stakeholder', 'budget', 'agency', 'event',
+    'sports', 'consumer', 'b2b', 'training', 'education', 'enablement',
+    'international', 'emea', 'analytics', 'content', 'creative', 'community',
+    'creator', 'retail', 'activation', 'sponsorship', 'product marketing'
+)
+JUNIOR = re.compile(r'\b(intern(ship)?|werkstudent|working student|graduate trainee|junior|assistant|praktikant|apprentice|ausbildung)\b', re.I)
+GERMAN_STRONG = re.compile(
+    r'\b(?:german|deutsch(?:e|en|er|es)?)\b.{0,55}\b(?:c1|c2|native|fluent|business fluent|muttersprach\w*|verhandlungssicher)\b'
+    r'|\b(?:c1|c2|native|fluent|business fluent|muttersprach\w*|verhandlungssicher)\b.{0,55}\b(?:german|deutsch(?:e|en|er|es)?)\b', re.I)
+GERMANY = ('germany', 'deutschland', 'munich', 'münchen', 'bavaria', 'bayern', 'berlin', 'hamburg', 'frankfurt', 'stuttgart', 'köln', 'cologne', 'düsseldorf', 'leipzig', 'nürnberg', 'nuremberg')
+REMOTE = ('remote', 'europe', 'eu ', 'eu/', 'emea', 'worldwide', 'anywhere', 'global')
+OTHER_ONLY = ('united states', 'usa only', 'us only', 'canada only', 'united kingdom only', 'uk only', 'australia only', 'india only')
+STATS = Counter()
+
 def get(url):
- try:
-  with urllib.request.urlopen(urllib.request.Request(url,headers=UA),timeout=20) as r:return json.load(r)
- except Exception as e:print('Source unavailable:',url,str(e));return {}
-def clean(s):return re.sub(r'\s+',' ',html.unescape(re.sub('<[^>]+>',' ',str(s or '')))).strip()
-def source_remotive():
- data=get('https://remotive.com/api/remote-jobs?category=marketing')
- for x in data.get('jobs',[]):
-  yield dict(title=x.get('title',''),company=x.get('company_name',''),location=x.get('candidate_required_location',''),url=x.get('url',''),postedAt=x.get('publication_date','')[:10],description=clean(x.get('description','')),source='Remotive',salary=x.get('salary',''))
-def source_arbeitnow():
- for page in (1,2,3):
-  data=get('https://www.arbeitnow.com/api/job-board-api?page='+str(page))
-  if not data.get('data'):break
-  for x in data['data']:
-   dt=datetime.datetime.fromtimestamp(x['created_at'],datetime.timezone.utc).date().isoformat() if x.get('created_at') else ''
-   yield dict(title=x.get('title',''),company=x.get('company_name',''),location=x.get('location',''),url=x.get('url',''),postedAt=dt,description=clean(x.get('description','')),source='Arbeitnow',salary='')
-def score(x):
- t=x['title'].lower();d=x['description'].lower();loc=x['location'].lower();combined=t+' '+d
- if not any(k in t for k in POS) or any(k in t for k in EXCLUDE):return None
- # Explicit German fluency requirements are hard filters, not soft scoring.
- if re.search(r'(c1|c2|native|fluent|business fluent|muttersprach|verhandlungssicher).{0,30}(german|deutsch)|(german|deutsch).{0,30}(c1|c2|native|fluent|business fluent|muttersprach|verhandlungssicher)',combined):return None
- remote='remote' in loc or 'anywhere' in loc or 'europe' in loc or 'worldwide' in loc
- german='germany' in loc or 'deutschland' in loc or 'munich' in loc or 'münchen' in loc or 'bavaria' in loc or 'berlin' in loc or 'hamburg' in loc
- if not (remote or german):return None
- # Exclude explicit remote location restrictions that do not include Germany/Europe.
- if remote and not german and any(z in loc for z in ['united states','usa only','canada only','uk only','united kingdom only','australia only']):return None
- hits=[k for k in SKILLS if k in combined];title_hits=[k for k in TITLES if k in t]
- if not title_hits:return None
- match=min(96,55+len(hits)*2+len(title_hits)*6)
- if match<80:return None
- return match,hits
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=25) as response:
+            return json.load(response)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        print(f'SOURCE ERROR {url}: {type(exc).__name__}: {exc}', flush=True)
+        STATS['source_errors'] += 1
+        return {}
+
+def clean(value):
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', str(value or '')))).strip()
+
+def remotive():
+    data = get('https://remotive.com/api/remote-jobs?category=marketing')
+    rows = data.get('jobs', [])
+    print('Remotive fetched:', len(rows), flush=True)
+    for x in rows:
+        yield {
+            'title': x.get('title') or '', 'company': x.get('company_name') or '',
+            'location': x.get('candidate_required_location') or '',
+            'url': x.get('url') or '', 'postedAt': str(x.get('publication_date') or '')[:10],
+            'description': clean(x.get('description')), 'source': 'Remotive',
+            'salary': x.get('salary') or '', 'remote': True
+        }
+
+def arbeitnow():
+    total = 0
+    for page in range(1, 11):
+        data = get(f'https://www.arbeitnow.com/api/job-board-api?page={page}')
+        rows = data.get('data') or []
+        if not rows:
+            break
+        total += len(rows)
+        for x in rows:
+            timestamp = x.get('created_at')
+            try:
+                date = dt.datetime.fromtimestamp(int(timestamp), dt.timezone.utc).date().isoformat() if timestamp else ''
+            except (ValueError, TypeError, OverflowError):
+                date = ''
+            yield {
+                'title': x.get('title') or '', 'company': x.get('company_name') or '',
+                'location': x.get('location') or '', 'url': x.get('url') or '',
+                'postedAt': date, 'description': clean(x.get('description')),
+                'source': 'Arbeitnow', 'salary': '', 'remote': bool(x.get('remote'))
+            }
+    print('Arbeitnow fetched:', total, flush=True)
+
+def evaluate(x):
+    title = x['title'].lower()
+    desc = x['description'].lower()
+    loc = x['location'].lower()
+    if not any(term in title for term in TITLE_TERMS):
+        return None, 'unrelated_title'
+    if JUNIOR.search(title):
+        return None, 'junior_role'
+    # Exclude explicit C1/C2/native/fluent German requirements, but don't mistake
+    # English fluency for German fluency.
+    if GERMAN_STRONG.search(desc):
+        return None, 'advanced_german'
+    in_germany = any(term in loc for term in GERMANY)
+    remote_scope = any(term in loc for term in REMOTE)
+    if not in_germany and not remote_scope:
+        return None, 'outside_target_location'
+    if not in_germany and any(term in loc for term in OTHER_ONLY):
+        return None, 'restricted_remote_location'
+    # Remote listings with unspecified country eligibility remain provisional.
+    uncertain_remote = not in_germany and ('remote' in loc or 'anywhere' in loc or 'worldwide' in loc)
+    combined = title + ' ' + desc
+    hits = [term for term in SKILLS if term in combined]
+    strong = [term for term in STRONG_TITLES if term in title]
+    # Ranking estimate only: don't label keyword overlap as actual ATS match.
+    score = min(94, 60 + min(len(hits), 12) * 2 + (8 if strong else 0) + (4 if in_germany else 0))
+    if 'senior' in title or 'lead' in title or 'head of' in title:
+        score = min(96, score + 3)
+    if score < 70:
+        return None, 'low_preliminary_score'
+    return (score, hits, uncertain_remote), 'accepted'
 
 def main():
- today=datetime.datetime.now(datetime.timezone.utc).date()
- old={}
- if OUT.exists():
-  try:old={j['url']:j for j in json.loads(OUT.read_text()).get('jobs',[]) if j.get('url')}
-  except Exception:pass
- found={}
- for x in list(source_remotive())+list(source_arbeitnow()):
-  if not x['url'] or not x['company'] or not x['title']:continue
-  if x['postedAt']:
-   try:
-    age=(today-datetime.date.fromisoformat(x['postedAt'])).days
-    if age>14 or age<0:continue
-   except ValueError:pass
-  result=score(x)
-  if not result:continue
-  match,hits=result
-  j={k:x[k] for k in ['title','company','location','url','postedAt','source','salary']}
-  j.update(match=match,reason='Evidence in listing: '+', '.join(hits[:7]),gaps='Verify salary, German-language requirements, seniority and work eligibility; automated score is preliminary.',status=old.get(x['url'],{}).get('status','new'))
-  found[x['url']]=j
- # retain prior matches so dashboard history is not lost
- for url,j in old.items():found.setdefault(url,j)
- jobs=sorted(found.values(),key=lambda j:(j.get('postedAt',''),j.get('match',0)),reverse=True)[:300]
- OUT.parent.mkdir(exist_ok=True,parents=True)
- OUT.write_text(json.dumps({'updated':datetime.datetime.now(datetime.timezone.utc).isoformat(),'jobs':jobs,'sources':['Remotive','Arbeitnow'],'notice':'Public-source coverage only; matches are heuristic and require human verification.'},indent=2,ensure_ascii=False))
- print('Jobs in feed:',len(jobs))
-if __name__=='__main__':main()
+    today = dt.datetime.now(dt.timezone.utc).date()
+    old = {}
+    if OUT.exists():
+        try:
+            old = {j['url']: j for j in json.loads(OUT.read_text(encoding='utf-8')).get('jobs', []) if j.get('url')}
+        except (OSError, ValueError, KeyError, TypeError):
+            print('Existing feed unreadable; starting fresh', flush=True)
+    found = {}
+    sources = [remotive, arbeitnow]
+    for source in sources:
+        for x in source():
+            STATS['fetched'] += 1
+            if not x['url'] or not x['company'] or not x['title']:
+                STATS['missing_fields'] += 1
+                continue
+            if x['postedAt']:
+                try:
+                    age = (today - dt.date.fromisoformat(x['postedAt'])).days
+                    if age > 30 or age < -1:
+                        STATS['outside_30_days'] += 1
+                        continue
+                except ValueError:
+                    STATS['invalid_date'] += 1
+            result, reason = evaluate(x)
+            STATS[reason] += 1
+            if result is None:
+                continue
+            score, hits, uncertain = result
+            job = {key: x[key] for key in ('title', 'company', 'location', 'url', 'postedAt', 'source', 'salary')}
+            job.update(
+                match=score,
+                reason='Keyword evidence: ' + ', '.join(hits[:8]) + '. Preliminary estimate, not an AI/CV assessment.',
+                gaps=('Confirm remote eligibility for Germany. ' if uncertain else '') +
+                     'Verify salary (target €85k+), German requirements and seniority.',
+                status=old.get(x['url'], {}).get('status', 'new')
+            )
+            found[x['url']] = job
+    for url, job in old.items():
+        found.setdefault(url, job)
+    jobs = sorted(found.values(), key=lambda j: (j.get('postedAt') or '', j.get('match') or 0), reverse=True)[:300]
+    OUT.parent.mkdir(exist_ok=True, parents=True)
+    OUT.write_text(json.dumps({
+        'updated': dt.datetime.now(dt.timezone.utc).isoformat(),
+        'jobs': jobs, 'sources': ['Remotive', 'Arbeitnow'],
+        'notice': 'Public-source coverage only. Match scores are heuristic; check German language, salary and Germany eligibility.'
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+    print('FILTER DIAGNOSTICS:', dict(STATS), flush=True)
+    print('Jobs in feed:', len(jobs), flush=True)
+    if not jobs:
+        print('No matches. Review source counts and filter diagnostics above.', flush=True)
+
+if __name__ == '__main__':
+    main()
