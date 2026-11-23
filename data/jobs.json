@@ -1,1 +1,9 @@
-{"updated":null,"jobs":[],"sources":[],"notice":"Awaiting first scheduled run"}
+{
+  "updated": "2026-11-23T16:21:32.258464+00:00",
+  "jobs": [],
+  "sources": [
+    "Remotive",
+    "Arbeitnow"
+  ],
+  "notice": "Public-source coverage only; matches are heuristic and require human verification."
+}
